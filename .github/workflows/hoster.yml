@@ -1,177 +1,291 @@
+name: Horizon web build + quick tunnel
 
-name: Horizon Web Quick Tunnel
+# Put this at .github/workflows/horizon-web-tunnel.yml
+#
+# One-time setup: Settings -> Secrets and variables -> Actions -> New repository secret
+#   TUNNEL_PASSWORD = any password you want (the login user is "horizon")
+#
+# Then Actions -> "Horizon web build + quick tunnel" -> Run workflow.
+# The trycloudflare.com URL shows up in the run's Summary tab and at the end of the
+# "Start tunnel" step. It stays up for `duration_minutes`, then the job ends.
 
 on:
   workflow_dispatch:
     inputs:
-      duration:
-        description: "How long should the tunnel stay online?"
-        required: true
+      duration_minutes:
+        description: "How long to keep the tunnel up (max ~330)"
+        default: "120"
+      profile:
+        description: "release = LTO + wasm-opt (slow, ~30-60 min cold). fast = quick dev build"
         type: choice
-        default: "60"
-        options:
-          - "15"
-          - "30"
-          - "60"
-          - "120"
-          - "180"
+        options: [release, fast]
+        default: release
+      mc_version:
+        description: "Minecraft version to fetch from Mojang"
+        default: "26.3"
 
-permissions:
-  contents: read
+concurrency:
+  group: horizon-web-tunnel
+  cancel-in-progress: true
 
 jobs:
-  build-and-host:
-    name: Build Horizon Web and start Quick Tunnel
-    runs-on: ubuntu-latest
-    timeout-minutes: 240
-
+  build-and-serve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
     env:
-      HORIZON_MINECRAFT_DIR: ${{ github.workspace }}/user/minecraft/.minecraft
+      MC_VERSION: ${{ inputs.mc_version }}
+      MC_DIR: ${{ github.workspace }}/mc/.minecraft
+      SERVER_JAR: ${{ github.workspace }}/mc/server.jar
+      HORIZON_MINECRAFT_DIR: ${{ github.workspace }}/mc/.minecraft
+      HORIZON_SERVER_JAR: ${{ github.workspace }}/mc/server.jar
+      NIGHTLY: nightly-2026-10-14
+      WASM_BINDGEN_VERSION: "0.2.129"
+      TUNNEL_PASSWORD: ${{ secrets.TUNNEL_PASSWORD }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - name: Check the password secret exists
+        run: |
+          if [ -z "$TUNNEL_PASSWORD" ]; then
+            echo "::error::Add a repository secret named TUNNEL_PASSWORD first. This repo is public, so the tunnel must not be open."
+            exit 1
+          fi
 
-      - name: Set up Java
-        uses: actions/setup-java@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "25"
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Install required nightly Rust toolchain
-        run: |
-          rustup toolchain install nightly-2026-10-14 \
-            --component rust-src \
-            --profile minimal
-
-      - name: Cache Rust build files
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install Binaryen
+      - name: System packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y binaryen jq
+          sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev binaryen pkg-config
+          wasm-opt --version
 
-      - name: Install wasm-bindgen-cli
+      - name: Rust toolchains
         run: |
-          cargo install wasm-bindgen-cli \
-            --version 0.2.129 \
-            --locked
+          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+          rustup default stable
+          rustup toolchain install "$NIGHTLY" --profile minimal --component rust-src --target wasm32-unknown-unknown
+          rustc --version
 
-      - name: Find Minecraft server jar
-        id: minecraft
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/wasm-bindgen
+            ~/.cargo/bin/wasm-bindgen-test-runner
+            ~/.cargo/bin/wasm2es6js
+            target
+          key: horizon-${{ runner.os }}-${{ env.NIGHTLY }}-wb${{ env.WASM_BINDGEN_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            horizon-${{ runner.os }}-${{ env.NIGHTLY }}-wb${{ env.WASM_BINDGEN_VERSION }}-
+
+      - name: wasm-bindgen-cli (version pinned to Cargo.lock)
         run: |
-          VERSION_JSON="$HORIZON_MINECRAFT_DIR/versions/26.3/26.3.json"
-
-          if [ ! -f "$VERSION_JSON" ]; then
-            echo "::error::Minecraft 26.3 version JSON was not found at $VERSION_JSON"
-            exit 1
+          if ! command -v wasm-bindgen >/dev/null || ! wasm-bindgen --version | grep -q "$WASM_BINDGEN_VERSION"; then
+            cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
           fi
+          wasm-bindgen --version
 
-          SERVER_URL="$(jq -r '.downloads.server.url' "$VERSION_JSON")"
-
-          if [ -z "$SERVER_URL" ] || [ "$SERVER_URL" = "null" ]; then
-            echo "::error::Could not find the Minecraft server download URL."
-            exit 1
-          fi
-
-          mkdir -p "$RUNNER_TEMP/minecraft"
-          SERVER_JAR="$RUNNER_TEMP/minecraft/server.jar"
-
-          curl -fL "$SERVER_URL" -o "$SERVER_JAR"
-
-          echo "server_jar=$SERVER_JAR" >> "$GITHUB_OUTPUT"
-
-      - name: Prepare Horizon resources
+      # Headless replacement for "play 26.3 once in the official launcher":
+      # pulls the same files the launcher would put in .minecraft straight from
+      # Mojang's public endpoints (version json, client jar, libraries, asset
+      # index + objects), plus the server jar. No window, no login, no GPU needed.
+      - name: Download Minecraft client, server jar and assets
         run: |
-          cargo run --release -p horizon-prepare -- \
-            --prepare \
-            --server-jar "${{ steps.minecraft.outputs.server_jar }}"
+          mkdir -p "$MC_DIR"
+          python3 - <<'PY'
+          import hashlib, json, os, urllib.request
+          from concurrent.futures import ThreadPoolExecutor
 
-      - name: Build Horizon Web
+          VER = os.environ["MC_VERSION"]
+          ROOT = os.environ["MC_DIR"]
+          SERVER_JAR = os.environ["SERVER_JAR"]
+          HDR = {"User-Agent": "horizon-ci/1.0"}
+
+          def get(url):
+              req = urllib.request.Request(url, headers=HDR)
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  return r.read()
+
+          def fetch(url, dest, sha1=None):
+              if os.path.exists(dest):
+                  return
+              os.makedirs(os.path.dirname(dest), exist_ok=True)
+              for attempt in range(5):
+                  try:
+                      data = get(url)
+                      if sha1 and hashlib.sha1(data).hexdigest() != sha1:
+                          raise IOError("sha1 mismatch for " + url)
+                      with open(dest, "wb") as f:
+                          f.write(data)
+                      return
+                  except Exception:
+                      if attempt == 4:
+                          raise
+
+          def allowed(lib):
+              rules = lib.get("rules")
+              if not rules:
+                  return True
+              ok = False
+              for r in rules:
+                  if "features" in r:
+                      continue
+                  name = r.get("os", {}).get("name")
+                  if name in (None, "linux"):
+                      ok = r["action"] == "allow"
+              return ok
+
+          manifest = json.loads(get("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"))
+          entry = next((v for v in manifest["versions"] if v["id"] == VER), None)
+          if entry is None:
+              raise SystemExit(f"{VER} is not in Mojang's version manifest")
+
+          raw = get(entry["url"])
+          vj = json.loads(raw)
+          vdir = f"{ROOT}/versions/{VER}"
+          os.makedirs(vdir, exist_ok=True)
+          with open(f"{vdir}/{VER}.json", "wb") as f:
+              f.write(raw)
+
+          client = vj["downloads"]["client"]
+          fetch(client["url"], f"{vdir}/{VER}.jar", client["sha1"])
+          server = vj["downloads"]["server"]
+          fetch(server["url"], SERVER_JAR, server["sha1"])
+          print("client + server jar done")
+
+          libs = []
+          for lib in vj.get("libraries", []):
+              art = lib.get("downloads", {}).get("artifact")
+              if art and allowed(lib):
+                  libs.append((art["url"], f"{ROOT}/libraries/{art['path']}", art["sha1"]))
+          with ThreadPoolExecutor(16) as ex:
+              list(ex.map(lambda j: fetch(*j), libs))
+          print(f"{len(libs)} libraries done")
+
+          ai = vj["assetIndex"]
+          idx_raw = get(ai["url"])
+          os.makedirs(f"{ROOT}/assets/indexes", exist_ok=True)
+          with open(f"{ROOT}/assets/indexes/{ai['id']}.json", "wb") as f:
+              f.write(idx_raw)
+          hashes = sorted({o["hash"] for o in json.loads(idx_raw)["objects"].values()})
+          jobs = [
+              (f"https://resources.download.minecraft.net/{h[:2]}/{h}",
+               f"{ROOT}/assets/objects/{h[:2]}/{h}", h)
+              for h in hashes
+          ]
+          with ThreadPoolExecutor(24) as ex:
+              list(ex.map(lambda j: fetch(*j), jobs))
+          print(f"{len(jobs)} asset objects done")
+          PY
+          du -sh "$MC_DIR" "$SERVER_JAR"
+
+      - name: Prepare resources (horizon-prepare)
         run: |
-          cd web
-          PROFILE=fast WASM_OPT=0 ./build.sh
+          cargo run --release -p horizon-prepare -- --prepare --server-jar "$HORIZON_SERVER_JAR"
+          cargo run --release -p horizon-prepare -- sounds || echo "sounds step skipped"
+          ls .local/horizon-client/
 
-      - name: Install cloudflared
+      - name: Build web package
         run: |
-          curl -fL \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-            -o cloudflared
+          if [ "${{ inputs.profile }}" = "fast" ]; then export PROFILE=fast; fi
+          python3 web/package.py folder
+          ls -la web/out/horizon-web | head -30
 
-          chmod +x cloudflared
-          sudo install cloudflared /usr/local/bin/cloudflared
-          cloudflared --version
-
-      - name: Start Horizon Web server
+      - name: Write password-protected static server
         run: |
-          python3 web/serve.py 8080 > "$RUNNER_TEMP/horizon-server.log" 2>&1 &
-          echo "$!" > "$RUNNER_TEMP/horizon-server.pid"
+          cat > "$RUNNER_TEMP/serve_private.py" <<'PY'
+          import base64, hmac, os, sys
+          from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+          from functools import partial
 
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8080/ >/dev/null; then
-              echo "Horizon Web server is responding."
-              exit 0
-            fi
+          root, port = sys.argv[1], int(sys.argv[2])
+          want = "Basic " + base64.b64encode(("horizon:" + os.environ["TUNNEL_PASSWORD"]).encode()).decode()
 
-            sleep 2
-          done
+          class Handler(SimpleHTTPRequestHandler):
+              def end_headers(self):
+                  # needed for SharedArrayBuffer (threads)
+                  self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+                  self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
+                  self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+                  super().end_headers()
 
-          echo "::error::Horizon Web server did not start."
-          cat "$RUNNER_TEMP/horizon-server.log"
-          exit 1
+              def authed(self):
+                  got = self.headers.get("Authorization", "")
+                  if hmac.compare_digest(got, want):
+                      return True
+                  self.send_response(401)
+                  self.send_header("WWW-Authenticate", 'Basic realm="horizon"')
+                  self.send_header("Content-Length", "0")
+                  self.end_headers()
+                  return False
 
-      - name: Start Cloudflare Quick Tunnel
+              def do_GET(self):
+                  if self.authed():
+                      super().do_GET()
+
+              def do_HEAD(self):
+                  if self.authed():
+                      super().do_HEAD()
+
+              def log_message(self, *a):
+                  pass
+
+          ThreadingHTTPServer(("127.0.0.1", port), partial(Handler, directory=root)).serve_forever()
+          PY
+
+      - name: Start tunnel and keep it up
         run: |
-          cloudflared tunnel \
-            --no-autoupdate \
-            --url http://127.0.0.1:8080 \
+          python3 "$RUNNER_TEMP/serve_private.py" web/out/horizon-web 8080 &
+          sleep 2
+          curl -fsS -o /dev/null -w "local check without auth (expect 401): %{http_code}\n" http://127.0.0.1:8080/ || true
+
+          curl -fsSL -o "$RUNNER_TEMP/cloudflared" \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x "$RUNNER_TEMP/cloudflared"
+          nohup "$RUNNER_TEMP/cloudflared" tunnel --no-autoupdate --url http://127.0.0.1:8080 \
             > "$RUNNER_TEMP/cloudflared.log" 2>&1 &
+          CF_PID=$!
 
-          echo "$!" > "$RUNNER_TEMP/cloudflared.pid"
-
-          for i in $(seq 1 60); do
-            TUNNEL_URL="$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
-              "$RUNNER_TEMP/cloudflared.log" | head -n 1 || true)"
-
-            if [ -n "$TUNNEL_URL" ]; then
-              echo "HORIZON_TUNNEL_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
-              echo "## Horizon Web is available" >> "$GITHUB_STEP_SUMMARY"
-              echo "$TUNNEL_URL" >> "$GITHUB_STEP_SUMMARY"
-              echo ""
-              echo "Quick Tunnel URL: $TUNNEL_URL"
-              exit 0
-            fi
-
+          URL=""
+          for i in $(seq 1 45); do
+            URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$RUNNER_TEMP/cloudflared.log" | head -1 || true)
+            [ -n "$URL" ] && break
             sleep 2
           done
-
-          echo "::error::Cloudflare Quick Tunnel did not provide a URL."
-          cat "$RUNNER_TEMP/cloudflared.log"
-          exit 1
-
-      - name: Keep tunnel online
-        run: |
-          echo "Horizon Web is available at:"
-          echo "$HORIZON_TUNNEL_URL"
-          echo "Keeping the runner alive for ${{ inputs.duration }} minutes."
-
-          sleep "${{ inputs.duration }}"m
-
-      - name: Stop server and tunnel
-        if: always()
-        run: |
-          if [ -f "$RUNNER_TEMP/cloudflared.pid" ]; then
-            kill "$(cat "$RUNNER_TEMP/cloudflared.pid")" || true
+          if [ -z "$URL" ]; then
+            echo "::error::cloudflared did not give a URL"
+            cat "$RUNNER_TEMP/cloudflared.log"
+            exit 1
           fi
 
-          if [ -f "$RUNNER_TEMP/horizon-server.pid" ]; then
-            kill "$(cat "$RUNNER_TEMP/horizon-server.pid")" || true
-          fi
+          {
+            echo "### Horizon web is up"
+            echo ""
+            echo "**URL:** $URL"
+            echo ""
+            echo "Login: user \`horizon\`, password = your \`TUNNEL_PASSWORD\` secret."
+            echo "Use Chrome or Edge (WebGPU). Up for about ${{ inputs.duration_minutes }} minutes."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "TUNNEL URL: $URL"
+
+          END=$(( $(date +%s) + ${{ inputs.duration_minutes }} * 60 ))
+          while [ "$(date +%s)" -lt "$END" ]; do
+            if ! kill -0 "$CF_PID" 2>/dev/null; then
+              echo "::error::cloudflared exited"
+              tail -n 50 "$RUNNER_TEMP/cloudflared.log"
+              exit 1
+            fi
+            sleep 30
+          done
+          echo "Time is up, shutting down."
