@@ -57,7 +57,7 @@ async function versioned() {
         .then((r) => (r.ok ? r.json() : {}))
         .catch(() => ({}));
     const at = (path) => (files[path] ? `${path}?v=${files[path]}` : path);
-    const pkg = !window.crossOriginIsolated && files["pkg-st/horizon-client_bg.wasm"] ? "pkg-st" : "pkg";
+    const pkg = "pkg-st";
     return { pkg, wasm: at(`${pkg}/horizon-client_bg.wasm`), boot: at("fs/boot.tar.gz") };
 }
 
