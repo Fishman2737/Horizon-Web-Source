@@ -28,6 +28,8 @@ impl Screen {
             | Self::ConfirmLink
             | Self::DialogWarning
             | Self::DebugOptions => true,
+            #[cfg(target_arch = "wasm32")]
+            Self::Extrium => true,
             Self::Playing
             | Self::GameModeSwitcher
             | Self::Chat

@@ -1012,6 +1012,8 @@ impl Game<'_> {
         }
         match self.screen {
             Screen::Playing => "playing",
+            #[cfg(target_arch = "wasm32")]
+            Screen::Extrium => "extrium",
             Screen::GameModeSwitcher => "gamemode-switcher",
             Screen::Paused => "paused",
             Screen::Options => "options",

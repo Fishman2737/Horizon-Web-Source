@@ -167,12 +167,19 @@ pub fn horizon_start(args: Vec<String>) {
     *ARGS.lock().unwrap_or_else(|e| e.into_inner()) = args;
     std::panic::set_hook(Box::new(|info| {
         horizon_console(1, &format!("Horizon panicked: {info}"));
+        horizon_console(
+            1,
+            &format!("Horizon panic backtrace:\n{}", std::backtrace::Backtrace::force_capture()),
+        );
     }));
     #[cfg(target_feature = "atomics")]
     crate::net::install();
     let start = START.lock().unwrap_or_else(|e| e.into_inner()).take();
     match start {
-        Some(start) => start(),
+        Some(start) => {
+            horizon_console(3, "Horizon: entering game startup");
+            start();
+        }
         None => horizon_console(1, "Horizon: no game registered to start"),
     }
 }

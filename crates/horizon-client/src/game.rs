@@ -120,6 +120,8 @@ mod events;
 mod execution_role;
 mod explosion;
 mod extras;
+#[cfg(target_arch = "wasm32")]
+mod extrium;
 mod falling_damage;
 mod fangs;
 mod fireworks;
@@ -738,6 +740,8 @@ impl Options {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Playing,
+    #[cfg(target_arch = "wasm32")]
+    Extrium,
     GameModeSwitcher,
     Paused,
     Options,
@@ -776,6 +780,8 @@ impl Screen {
     fn id(self) -> &'static str {
         match self {
             Screen::Playing => "playing",
+            #[cfg(target_arch = "wasm32")]
+            Screen::Extrium => "extrium",
             Screen::GameModeSwitcher => "game_mode_switcher",
             Screen::Paused => "paused",
             Screen::Options => "options",
@@ -2704,6 +2710,8 @@ struct Game<'a> {
     /// MultiPlayerGameMode.previousLocalPlayerMode (F3+N goes back to it).
     previous_mode: Option<horizon_client::command::args::GameMode>,
     gamemode_switcher: Option<horizon_client::game_mode_switcher::GameModeSwitcher>,
+    #[cfg(target_arch = "wasm32")]
+    extrium: extrium::Extrium,
     /// The system clipboard (`KeyboardHandler.clipboardManager`).
     clipboard: horizon_client::clipboard::SystemClipboard,
     /// Select All in the append-only text fields.
@@ -8131,6 +8139,8 @@ impl Game<'_> {
                 );
             }
             Screen::GameModeSwitcher => self.draw_gamemode_switcher(&mut batch),
+            #[cfg(target_arch = "wasm32")]
+            Screen::Extrium => self.draw_extrium(&mut batch),
             Screen::Dead => self.draw_death_screen(&mut batch),
             Screen::Stats => self.draw_stats(&mut batch),
             Screen::Advancements => self.draw_advancements(&mut batch),
@@ -15147,6 +15157,8 @@ impl Game<'_> {
         }
         match key {
             KeyCode::Escape => match self.screen {
+                #[cfg(target_arch = "wasm32")]
+                Screen::Extrium => self.extrium_escape(),
                 Screen::Options => self.options_key(KeyCode::Escape, None)?,
                 Screen::Playing => {
                     self.pause_focus = None;
@@ -15186,6 +15198,10 @@ impl Game<'_> {
                 Screen::Win => self.close_win_screen()?,
                 Screen::DebugOptions => self.close_debug_options(),
             },
+            #[cfg(target_arch = "wasm32")]
+            KeyCode::ShiftRight if self.screen == Screen::Playing => self.open_extrium(),
+            #[cfg(target_arch = "wasm32")]
+            KeyCode::ShiftRight if self.screen == Screen::Extrium => self.close_extrium(),
             KeyCode::Digit1
             | KeyCode::Digit2
             | KeyCode::Digit3
@@ -15819,6 +15835,28 @@ impl Game<'_> {
             self.sync_toggle(SNEAK);
             self.sync_toggle(SPRINT);
         }
+        #[cfg(target_arch = "wasm32")]
+        if self.screen == Screen::Extrium {
+            if let WindowEvent::KeyboardInput { event, .. } = &event {
+                if event.state == ElementState::Pressed && !event.repeat {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::Escape) => self.extrium_escape(),
+                        PhysicalKey::Code(KeyCode::ShiftRight) => self.close_extrium(),
+                        _ => {}
+                    }
+                }
+                return;
+            }
+        } else if let WindowEvent::KeyboardInput { event, .. } = &event
+            && event.state == ElementState::Pressed
+            && !event.repeat
+            && event.physical_key == PhysicalKey::Code(KeyCode::ShiftRight)
+            && self.title.is_none()
+            && self.screen == Screen::Playing
+        {
+            self.open_extrium();
+            return;
+        }
         // `PackSelectionScreen.onFilesDrop` on the Create New World screen.
         if let WindowEvent::DroppedFile(path) = &event
             && let Some(title) = &mut self.title
@@ -16316,6 +16354,10 @@ impl Game<'_> {
                     if self.screen == Screen::DebugOptions && d != 0.0 {
                         self.debug_options_scroll(d);
                     }
+                    #[cfg(target_arch = "wasm32")]
+                    if self.screen == Screen::Extrium && d != 0.0 {
+                        self.extrium_scroll(d);
+                    }
                     if self.screen == Screen::Advancements {
                         self.advancements_scroll(scaled(raw_x) as f32, d);
                     }
@@ -16438,6 +16480,8 @@ impl Game<'_> {
                         return Ok(());
                     }
                     match self.screen {
+                        #[cfg(target_arch = "wasm32")]
+                        Screen::Extrium if pressed => self.extrium_click(button),
                         Screen::Playing => {
                             if pressed && !self.captured {
                                 self.capture(true);
@@ -17365,6 +17409,8 @@ impl<'a> Game<'a> {
             pause: false,
             debug: false,
             screen: Screen::Playing,
+            #[cfg(target_arch = "wasm32")]
+            extrium: extrium::Extrium::default(),
             window: None,
             renderer: None,
             entity_vertices: Vec::new(),
