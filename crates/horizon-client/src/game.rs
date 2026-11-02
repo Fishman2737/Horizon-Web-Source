@@ -2326,7 +2326,7 @@ struct Game<'a> {
     loading_progress: f32,
     /// `CreateWorldScreen.openCreateWorldScreen`'s data read, on a worker,
     /// while the title says `createWorld.preparing`.
-    creation_job: Option<std::thread::JoinHandle<std::result::Result<(), String>>>,
+    creation_job: Option<horizon_os::thread::JoinHandle<std::result::Result<(), String>>>,
     /// When `loading_progress` last eased (the server thread's load, 50 ms a step).
     loading_progress_at: Option<horizon_os::time::Instant>,
     /// The world spawn search's origin chunk and fallback height, once known.
@@ -17976,7 +17976,7 @@ impl Game<'_> {
                     )
                 })
                 .unwrap_or_default();
-            self.creation_job = std::thread::Builder::new()
+            self.creation_job = horizon_os::thread::Builder::new()
                 .name("world-creation".into())
                 .spawn(move || {
                     horizon_client::vanillagen::shared_data_with(&dir, &overrides, registry)
@@ -17989,7 +17989,7 @@ impl Game<'_> {
         if !self
             .creation_job
             .as_ref()
-            .is_none_or(std::thread::JoinHandle::is_finished)
+            .is_none_or(|job| job.is_finished())
         {
             return;
         }
@@ -19304,7 +19304,7 @@ impl Loading {
         let boot_paint_stop = hwnd(&window).map(|hwnd| {
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let repaint_stop = stop.clone();
-            std::thread::spawn(move || {
+            horizon_os::thread::spawn(move || {
                 while !repaint_stop.load(std::sync::atomic::Ordering::Relaxed) {
                     horizon_threads::boot_paint::paint(
                         hwnd,
@@ -19312,7 +19312,7 @@ impl Loading {
                         horizon_theme::fonts::GEIST_MONO,
                         &horizon_client::logging::recent_lines(),
                     );
-                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    horizon_os::thread::sleep(std::time::Duration::from_millis(300));
                 }
             });
             stop
