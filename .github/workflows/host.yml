@@ -1,0 +1,177 @@
+
+name: Horizon Web Quick Tunnel
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "How long should the tunnel stay online?"
+        required: true
+        type: choice
+        default: "60"
+        options:
+          - "15"
+          - "30"
+          - "60"
+          - "120"
+          - "180"
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-host:
+    name: Build Horizon Web and start Quick Tunnel
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    env:
+      HORIZON_MINECRAFT_DIR: ${{ github.workspace }}/user/minecraft/.minecraft
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install required nightly Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-10-14 \
+            --component rust-src \
+            --profile minimal
+
+      - name: Cache Rust build files
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Binaryen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binaryen jq
+
+      - name: Install wasm-bindgen-cli
+        run: |
+          cargo install wasm-bindgen-cli \
+            --version 0.2.129 \
+            --locked
+
+      - name: Find Minecraft server jar
+        id: minecraft
+        run: |
+          VERSION_JSON="$HORIZON_MINECRAFT_DIR/versions/26.3/26.3.json"
+
+          if [ ! -f "$VERSION_JSON" ]; then
+            echo "::error::Minecraft 26.3 version JSON was not found at $VERSION_JSON"
+            exit 1
+          fi
+
+          SERVER_URL="$(jq -r '.downloads.server.url' "$VERSION_JSON")"
+
+          if [ -z "$SERVER_URL" ] || [ "$SERVER_URL" = "null" ]; then
+            echo "::error::Could not find the Minecraft server download URL."
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/minecraft"
+          SERVER_JAR="$RUNNER_TEMP/minecraft/server.jar"
+
+          curl -fL "$SERVER_URL" -o "$SERVER_JAR"
+
+          echo "server_jar=$SERVER_JAR" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare Horizon resources
+        run: |
+          cargo run --release -p horizon-prepare -- \
+            --prepare \
+            --server-jar "${{ steps.minecraft.outputs.server_jar }}"
+
+      - name: Build Horizon Web
+        run: |
+          cd web
+          PROFILE=fast WASM_OPT=0 ./build.sh
+
+      - name: Install cloudflared
+        run: |
+          curl -fL \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o cloudflared
+
+          chmod +x cloudflared
+          sudo install cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Start Horizon Web server
+        run: |
+          python3 web/serve.py 8080 > "$RUNNER_TEMP/horizon-server.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/horizon-server.pid"
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/ >/dev/null; then
+              echo "Horizon Web server is responding."
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          echo "::error::Horizon Web server did not start."
+          cat "$RUNNER_TEMP/horizon-server.log"
+          exit 1
+
+      - name: Start Cloudflare Quick Tunnel
+        run: |
+          cloudflared tunnel \
+            --no-autoupdate \
+            --url http://127.0.0.1:8080 \
+            > "$RUNNER_TEMP/cloudflared.log" 2>&1 &
+
+          echo "$!" > "$RUNNER_TEMP/cloudflared.pid"
+
+          for i in $(seq 1 60); do
+            TUNNEL_URL="$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+              "$RUNNER_TEMP/cloudflared.log" | head -n 1 || true)"
+
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "HORIZON_TUNNEL_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
+              echo "## Horizon Web is available" >> "$GITHUB_STEP_SUMMARY"
+              echo "$TUNNEL_URL" >> "$GITHUB_STEP_SUMMARY"
+              echo ""
+              echo "Quick Tunnel URL: $TUNNEL_URL"
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          echo "::error::Cloudflare Quick Tunnel did not provide a URL."
+          cat "$RUNNER_TEMP/cloudflared.log"
+          exit 1
+
+      - name: Keep tunnel online
+        run: |
+          echo "Horizon Web is available at:"
+          echo "$HORIZON_TUNNEL_URL"
+          echo "Keeping the runner alive for ${{ inputs.duration }} minutes."
+
+          sleep "${{ inputs.duration }}"m
+
+      - name: Stop server and tunnel
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/cloudflared.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/cloudflared.pid")" || true
+          fi
+
+          if [ -f "$RUNNER_TEMP/horizon-server.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/horizon-server.pid")" || true
+          fi
