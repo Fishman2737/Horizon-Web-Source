@@ -18261,12 +18261,12 @@ fn launch_world(options: &Options) -> Option<&str> {
 /// A step of the resource load: on its own scoped thread, or, when the
 /// settings allow a single worker, run where it is joined.
 enum Step<'scope, T> {
-    Thread(std::thread::ScopedJoinHandle<'scope, T>),
+    Thread(horizon_os::thread::ScopedJoinHandle<'scope, T>),
     Later(Box<dyn FnOnce() -> T + Send + 'scope>),
 }
 impl<'scope, T: Send + 'scope> Step<'scope, T> {
     fn spawn(
-        scope: &'scope std::thread::Scope<'scope, '_>,
+        scope: &'scope horizon_os::thread::Scope<'scope, '_>,
         parallel: bool,
         f: impl FnOnce() -> T + Send + 'scope,
     ) -> Self {
@@ -18324,7 +18324,7 @@ fn load_core(
     progress.set(1);
     let registry = assets.registry;
     let (render, gameplay, visibility, biomes, environment, collision) =
-        std::thread::scope(|scope| {
+        horizon_os::thread::scope(|scope| {
             let assets = &assets;
             let render = Step::spawn(scope, parallel, move || {
                 // A server reads no block sprites' pixels, which only the
@@ -18409,7 +18409,7 @@ fn gameplay_tables(
             .any(|s| !s.name.starts_with("minecraft:")),
     );
     progress.set(2);
-    let (light, motion) = std::thread::scope(|scope| {
+    let (light, motion) = horizon_os::thread::scope(|scope| {
         let light = Step::spawn(scope, parallel, || {
             LightTables::load(root, assets.registry, &facts).map_err(|e| e.to_string())
         });
@@ -18476,7 +18476,7 @@ fn load_resources(
         }
     };
     let (core, loaded_gui) = loop {
-        let (ui, core) = std::thread::scope(|scope| {
+        let (ui, core) = horizon_os::thread::scope(|scope| {
             let core = Step::spawn(scope, parallel, || {
                 load_core(&root, headless, parallel, progress)
             });
@@ -18721,7 +18721,7 @@ fn load_world_rest(
         result.map_err(|e| e.to_string())
     }
     let (items, behaviours, block_entity_render, animate, mobs, transformers) = if threads > 1 {
-        std::thread::scope(|scope| {
+        horizon_os::thread::scope(|scope| {
             let items = scope.spawn(|| text(load_items()));
             let behaviours = scope.spawn(|| text(load_behaviours()));
             let block_entity_render = scope.spawn(|| text(load_block_entity_render()));
